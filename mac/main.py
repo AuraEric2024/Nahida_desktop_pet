@@ -23,15 +23,15 @@ import os
 import pygame.mixer
 import live2d.v3 as live2d
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QIcon, QSurfaceFormat
+from PyQt6.QtGui import QIcon, QSurfaceFormat, QCursor
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu,
 )
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 
 # Mac 专用的全局鼠标 API
-from Quartz import CGEventGetLocation
-from AppKit import NSEvent
+from AppKit import NSEvent, NSStatusWindowLevel
+import objc
 
 
 # ---------- 资源路径 ----------
@@ -100,6 +100,24 @@ class NahidaPet(QOpenGLWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(16)
+
+        # 延迟设置原生窗口置顶（必须在窗口创建后执行）
+        QTimer.singleShot(100, self._make_stay_on_top)
+
+    def _make_stay_on_top(self):
+        """Mac 专有：用原生 API 设置 NSWindow level，确保悬浮在所有应用之上。
+        Qt 的 WindowStaysOnTopHint 在 Mac 上不够可靠，需要直接设置原生级别。"""
+        try:
+            # winId() 在 Mac 上返回 NSView 的指针
+            ptr = int(self.winId())
+            ns_view = objc.objc_object(c_void_p=ptr)
+            ns_window = ns_view.window()
+            # NSStatusWindowLevel 高于普通应用窗口，确保始终置顶
+            ns_window.setLevel_(NSStatusWindowLevel)
+            # 禁用动画，避免窗口移动时抖动
+            ns_window.setHasShadow_(False)
+        except Exception as e:
+            print(f"[置顶设置失败] {e}，使用 Qt 默认置顶")
 
     def _setup_global_mouse_monitor(self):
         """设置全局鼠标点击监听。
@@ -212,19 +230,12 @@ class NahidaPet(QOpenGLWidget):
     def _tick(self):
         if not self.model:
             return
-        # Mac 上获取全局鼠标位置：CGEventGetLocation 返回 Quartz 坐标（原点在左下角）
-        pt = CGEventGetLocation(None)
-        # 获取屏幕高度，用于 y 坐标转换（Quartz 坐标 → Qt 坐标）
-        # Quartz 原点在左下角，Qt 原点在左上角，需要翻转 y
-        screen = QApplication.primaryScreen()
-        screen_h = screen.size().height()
-        global_x = pt.x
-        global_y = screen_h - pt.y
-
+        # 用 Qt 的 QCursor.pos() 获取全局鼠标位置（跨平台，坐标系与 Qt 一致）
+        gp = QCursor.pos()
         # 转换为窗口局部坐标
         g = self.geometry()
-        lx = global_x - g.x()
-        ly = global_y - g.y()
+        lx = gp.x() - g.x()
+        ly = gp.y() - g.y()
         self._mouse_local = (lx, ly)
 
         # 触发重绘（paintGL 中会更新视线）
