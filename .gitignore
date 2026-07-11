@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 构建产物
+build/
+dist/
+*.spec
+mac/build/
+mac/dist/
+
+# PyInstaller/py2app 缓存
+*.pyc
+*.pyo
+
+# 调试日志
+*.log
+diag_out*.txt
