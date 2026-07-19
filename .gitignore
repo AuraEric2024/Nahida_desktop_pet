@@ -7,10 +7,8 @@ __pycache__/
 build/
 dist/
 *.spec
-mac/build/
-mac/dist/
 
-# PyInstaller/py2app 缓存
+# PyInstaller 缓存
 *.pyc
 *.pyo
 

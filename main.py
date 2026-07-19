@@ -9,7 +9,8 @@
   5. 滚轮自由缩放大小
   6. 按住拖拽移动窗口
   7. 系统托盘图标（单击显示/隐藏，右键菜单退出）
-依赖：live2d-py、PyQt6、PyOpenGL、pywin32、pygame
+  8. 摄像头头部追踪（本地 MediaPipe，可开关）
+依赖：live2d-py、PyQt6、PyOpenGL、pywin32、pygame、mediapipe、opencv-python
 """
 
 import sys
@@ -20,11 +21,13 @@ import win32api
 import pygame.mixer
 import live2d.v3 as live2d
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QIcon, QSurfaceFormat
+from PyQt6.QtGui import QIcon, QSurfaceFormat, QAction
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu,
 )
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+
+from camera_tracker import CameraTracker
 
 
 # ---------- 资源路径 ----------
@@ -75,10 +78,20 @@ class NahidaPet(QOpenGLWidget):
         # 视线/头部平滑值（用于缓动跟随，避免抖动）
         self._look_x = 0.0
         self._look_y = 0.0
+        # 摄像头数据的平滑值（独立于鼠标，避免两种模式互相干扰）
+        self._cam_x = 0.0
+        self._cam_y = 0.0
+        self._cam_roll = 0.0
+        self._cam_mouth = 0.0
 
         # 全局鼠标按键状态（用于检测"按下边沿"，实现全局点击音效）
         self._prev_left = False
         self._prev_right = False
+
+        # 摄像头头部追踪器（本地 MediaPipe，默认关闭）
+        self._cam_tracker = CameraTracker()
+        # 鼠标点击音效开关（默认开启）
+        self._click_sound_enabled = True
 
         # 主循环定时器：约 60 FPS
         self.timer = QTimer(self)
@@ -153,13 +166,60 @@ class NahidaPet(QOpenGLWidget):
 
     def _apply_look(self):
         """把当前视线值写入模型参数（头部/眼球/身体朝向）"""
-        lx, ly = self._look_x, self._look_y
-        self.model.SetParameterValue("ParamAngleX", max(-30, min(30, lx * 30)))
-        self.model.SetParameterValue("ParamAngleY", max(-30, min(30, ly * 30)))
-        self.model.SetParameterValue("ParamEyeBallX", max(-1, min(1, lx)))
-        self.model.SetParameterValue("ParamEyeBallY", max(-1, min(1, ly)))
-        self.model.SetParameterValue("ParamBodyAngleX", max(-10, min(10, lx * 10)))
-        self.model.SetParameterValue("ParamBodyAngleY", max(-10, min(10, ly * 10)))
+        cam_active = False
+        mouth_open = 0.0
+
+        if self._cam_tracker.enabled:
+            yaw, pitch, roll, mouth, face_ok = self._cam_tracker.get_pose()
+            if face_ok:
+                # 摄像头数据缓动平滑（0.15 较柔和，避免生硬跳变）
+                self._cam_x += (yaw - self._cam_x) * 0.15
+                self._cam_y += (pitch - self._cam_y) * 0.15
+                self._cam_roll += (roll - self._cam_roll) * 0.2
+                self._cam_mouth += (mouth - self._cam_mouth) * 0.3
+                cam_active = True
+                mouth_open = self._cam_mouth
+            else:
+                # 无人脸时平滑回正
+                self._cam_x *= 0.9
+                self._cam_y *= 0.9
+                self._cam_roll *= 0.9
+                self._cam_mouth *= 0.9
+        else:
+            # 摄像头关闭时，平滑值归零，避免下次开启时跳变
+            self._cam_x = 0.0
+            self._cam_y = 0.0
+            self._cam_roll = 0.0
+            self._cam_mouth = 0.0
+
+        if cam_active:
+            lx, ly = self._cam_x, self._cam_y
+            # 摄像头模式：身体探头（BodyAngle）+ 头部转动（Angle XYZ）+ 眼球
+            # ParamAngleZ 控制头部侧倾（歪头），范围 ±30
+            # 身体加大幅度让挪动可见，头部跟随做更明显的点头/转头
+            # 叠加轻微呼吸感晃动，让身体不死板
+            import math, time
+            breathe = math.sin(time.time() * 1.8) * 0.3  # 轻微呼吸感晃动
+            self.model.SetParameterValue("ParamBodyAngleX", max(-10, min(10, lx * 10 + breathe)))
+            self.model.SetParameterValue("ParamBodyAngleY", max(-10, min(10, ly * 10)))
+            self.model.SetParameterValue("ParamAngleX", max(-30, min(30, lx * 25)))
+            self.model.SetParameterValue("ParamAngleY", max(-30, min(30, ly * 30)))
+            self.model.SetParameterValue("ParamAngleZ", max(-30, min(30, self._cam_roll * 30)))
+            self.model.SetParameterValue("ParamEyeBallX", max(-1, min(1, lx)))
+            self.model.SetParameterValue("ParamEyeBallY", max(-1, min(1, ly * 1.2)))
+        else:
+            # 鼠标模式
+            lx, ly = self._look_x, self._look_y
+            self.model.SetParameterValue("ParamAngleX", max(-30, min(30, lx * 30)))
+            self.model.SetParameterValue("ParamAngleY", max(-30, min(30, ly * 30)))
+            self.model.SetParameterValue("ParamEyeBallX", max(-1, min(1, lx)))
+            self.model.SetParameterValue("ParamEyeBallY", max(-1, min(1, ly)))
+            self.model.SetParameterValue("ParamBodyAngleX", max(-10, min(10, lx * 10)))
+            self.model.SetParameterValue("ParamBodyAngleY", max(-10, min(10, ly * 10)))
+
+        # 嘴巴张合（摄像头开启时跟随用户嘴巴）
+        if cam_active and mouth_open > 0.02:
+            self.model.SetParameterValue("ParamMouthOpenY", mouth_open)
 
     # ---------- 主循环 ----------
     def _tick(self):
@@ -182,13 +242,14 @@ class NahidaPet(QOpenGLWidget):
         # 通过"上一帧未按下 → 本帧按下"的边沿触发，实现全局点击音效
         left_down = bool(win32api.GetAsyncKeyState(0x01) & 0x8000)   # VK_LBUTTON
         right_down = bool(win32api.GetAsyncKeyState(0x02) & 0x8000)  # VK_RBUTTON
-        if left_down and not self._prev_left:
-            # 左键按下（全局任意位置）→ click 音效 + 随机表情
-            self._snd_click.play()
-            self.model.SetRandomExpression()
-        if right_down and not self._prev_right:
-            # 右键按下（全局任意位置）→ barely 音效
-            self._snd_barely.play()
+        if self._click_sound_enabled:
+            if left_down and not self._prev_left:
+                # 左键按下（全局任意位置）→ click 音效 + 随机表情
+                self._snd_click.play()
+                self.model.SetRandomExpression()
+            if right_down and not self._prev_right:
+                # 右键按下（全局任意位置）→ barely 音效
+                self._snd_barely.play()
         self._prev_left = left_down
         self._prev_right = right_down
 
@@ -226,6 +287,7 @@ class NahidaPet(QOpenGLWidget):
     # ---------- 关闭 ----------
     def closeEvent(self, event):
         self.timer.stop()
+        self._cam_tracker.stop()  # 停止摄像头追踪并释放资源
         if self.model:
             del self.model
             self.model = None
@@ -250,6 +312,12 @@ def main():
     tray.setToolTip("纳西妲桌宠\n左键=click音效+表情 / 右键=barely音效 / 滚轮=缩放 / 拖拽=移动")
     menu = QMenu()
     act_show = menu.addAction("显示 / 隐藏")
+    act_cam = menu.addAction("摄像头头部追踪")
+    act_cam.setCheckable(True)   # 可勾选的开关
+    act_cam.setChecked(False)    # 默认关闭
+    act_snd = menu.addAction("点击音效")
+    act_snd.setCheckable(True)   # 可勾选的开关
+    act_snd.setChecked(True)     # 默认开启
     menu.addSeparator()
     act_quit = menu.addAction("退出")
     tray.setContextMenu(menu)
@@ -261,6 +329,22 @@ def main():
     def on_menu(action):
         if action is act_show:
             pet.setVisible(not pet.isVisible())
+        elif action is act_cam:
+            # 切换摄像头追踪开关
+            if action.isChecked():
+                pet._cam_tracker.start()
+                tray.showMessage("纳西妲桌宠", "摄像头追踪已开启（本地运行）\n正在加载模型，请稍候...",
+                                 QSystemTrayIcon.MessageIcon.Information, 3000)
+            else:
+                pet._cam_tracker.stop()
+                tray.showMessage("纳西妲桌宠", "摄像头追踪已关闭",
+                                 QSystemTrayIcon.MessageIcon.Information, 2000)
+        elif action is act_snd:
+            # 切换点击音效开关
+            pet._click_sound_enabled = action.isChecked()
+            state = "开启" if action.isChecked() else "关闭"
+            tray.showMessage("纳西妲桌宠", f"点击音效已{state}",
+                             QSystemTrayIcon.MessageIcon.Information, 1500)
         elif action is act_quit:
             pet.close()
             app.quit()
